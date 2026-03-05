@@ -206,7 +206,6 @@ public function create(Request $request)
         'name' => 'required|string|regex:/^[a-z0-9-]+$/|unique:sites,name',
         'domain_type' => 'required|in:subdomain,custom',
         'custom_domain' => 'nullable|string|unique:sites,custom_domain',
-        'port' => 'required|integer|min:8000|max:8999|unique:sites,port',
         'enable_redis' => 'boolean',
         'enable_ssl' => 'boolean'
     ]);
@@ -214,59 +213,51 @@ public function create(Request $request)
     try {
         DB::beginTransaction();
 
-        // Generate domain
+        // ---------------- GENERATE DOMAIN ----------------
         if ($request->domain_type === 'subdomain') {
-            $domain = $this->domain->generateSubdomain($request->name, $request->port);
+            $domain = $this->domain->generateSubdomain($request->name, 8081);
             $customDomain = null;
         } else {
             $domain = $request->custom_domain;
             $customDomain = $request->custom_domain;
         }
 
-        // ============== STEP 1: CREATE MYSQL CONTAINER ==============
+        // ---------------- STEP 1: CREATE MYSQL ----------------
         Log::info("Step 1: Creating MySQL container for: {$request->name}");
-        
-        $mysqlResult = $this->docker->createMySQL($request->name, $request->port);
+        $mysqlResult = $this->docker->createMySQL($request->name, 3306); // default MySQL port
         $mysqlContainerName = $mysqlResult['name'];
-        
         Log::info("MySQL container created: {$mysqlContainerName}");
+        sleep(10); // wait for MySQL to initialize
 
-        // Wait extra time for MySQL to fully initialize
-        sleep(10);
-
-        // ============== STEP 2: CREATE WORDPRESS CONTAINER ==============
+        // ---------------- STEP 2: CREATE WORDPRESS ----------------
         Log::info("Step 2: Creating WordPress container for: {$request->name}");
-        
+        $wordpressPort = $request->enable_ssl ? 443 : 8081; // default HTTP or HTTPS
+
         $wordpressResult = $this->docker->createWordPress(
-            $request->name, 
-            $request->port, 
+            $request->name,
             $domain,
             $request->enable_ssl ?? false,
             $mysqlContainerName
         );
-        
         $wordpressContainerName = $wordpressResult['name'];
-        
         Log::info("WordPress container created: {$wordpressContainerName}");
 
-        // ============== STEP 3: CREATE REDIS IF ENABLED ==============
+        // ---------------- STEP 3: CREATE REDIS IF ENABLED ----------------
         $redisContainerName = null;
         if ($request->enable_redis) {
             Log::info("Step 3: Creating Redis container for: {$request->name}");
-            
-            $redisResult = $this->docker->createRedis($request->name, $request->port);
+            $redisResult = $this->docker->createRedis($request->name, 6379); // default Redis port
             $redisContainerName = $redisResult['name'];
-            
             Log::info("Redis container created: {$redisContainerName}");
         }
 
-        // ============== STEP 4: STORE IN DATABASE ==============
+        // ---------------- STEP 4: STORE SITE IN DATABASE ----------------
         $site = Site::create([
             'name' => $request->name,
             'domain' => $domain,
             'custom_domain' => $customDomain,
             'domain_type' => $request->domain_type,
-            'port' => $request->port,
+            'port' => $wordpressPort, // store default port
             'status' => 'running',
             'container_id' => $wordpressContainerName,
             'ssl_enabled' => $request->enable_ssl ?? false,
@@ -274,20 +265,20 @@ public function create(Request $request)
             'user_id' => $request->user()->id ?? null,
         ]);
 
-        // Create database record
-        $database = Database::create([
+        // ---------------- CREATE DATABASE RECORD ----------------
+        Database::create([
             'site_id' => $site->id,
             'name' => $request->name . '_db',
             'status' => 'connected',
             'type' => 'mysql',
             'container_name' => $mysqlContainerName,
-            'port' => $request->port + 1000,
+            'port' => 3306,
             'database_name' => $mysqlResult['database'],
             'username' => $mysqlResult['username'],
             'password' => bcrypt($mysqlResult['password']),
         ]);
 
-        // Create Redis record if enabled
+        // ---------------- CREATE REDIS RECORD ----------------
         if ($request->enable_redis && $redisContainerName) {
             RedisInstance::create([
                 'site_id' => $site->id,
@@ -295,11 +286,11 @@ public function create(Request $request)
                 'status' => 'cached',
                 'type' => 'redis',
                 'container_name' => $redisContainerName,
-                'port' => $request->port + 2000,
+                'port' => 6379,
             ]);
         }
 
-        // Create initial stats
+        // ---------------- CREATE INITIAL SITE STATS ----------------
         SiteStat::create([
             'site_id' => $site->id,
             'cpu' => 0,
@@ -311,7 +302,6 @@ public function create(Request $request)
 
         DB::commit();
 
-        // Return success with site info
         return response()->json([
             'success' => true,
             'message' => 'WordPress site created successfully',
@@ -327,21 +317,20 @@ public function create(Request $request)
                     'database' => $mysqlResult['database'],
                     'username' => $mysqlResult['username'],
                     'password' => $mysqlResult['password'],
-                    'port' => $request->port + 1000
+                    'port' => 3306
                 ],
                 'wordpress' => [
                     'container' => $wordpressContainerName
                 ],
                 'redis' => $request->enable_redis ? [
                     'container' => $redisContainerName,
-                    'port' => $request->port + 2000
+                    'port' => 6379
                 ] : null
             ]
         ], 201);
 
     } catch (\Exception $e) {
         DB::rollBack();
-        
         Log::error('Failed to create site: ' . $e->getMessage(), [
             'trace' => $e->getTraceAsString()
         ]);

@@ -5,6 +5,12 @@ use Inertia\Inertia;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Http\Request;
+Route::get('/', function () {
+    return 'ok';
+});
+Route::get('/all', function () {
+    return 'ok';
+});
 Route::get('/dashboard', function () {
     return Inertia::render('Dashboard');
 });

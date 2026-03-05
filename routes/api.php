@@ -16,7 +16,9 @@ use App\Http\Controllers\StatsController;
 
 // Public routes
 Route::post('/login', [AuthController::class, 'login']);
-
+Route::get('/test', function () {
+    return 'api called';
+});
 // Protected routes (require authentication)
 Route::middleware('auth:sanctum')->group(function () {
     
