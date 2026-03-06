@@ -7,7 +7,7 @@ use App\Http\Controllers\DatabaseController;
 use App\Http\Controllers\RedisController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\StatsController;
-
+use Illuminate\Http\Request;
 /*
 |--------------------------------------------------------------------------
 | API Routes
@@ -99,3 +99,73 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/system/requirements', [DashboardController::class, 'requirements']);
 });
 
+
+
+Route::post('/create-site', function (Request $request) {
+
+    function runCommand($cmd, $wait = true) {
+        $output = shell_exec($cmd . ' 2>&1');
+        if ($wait) sleep(1);
+        return $output;
+    }
+
+    $siteName = $request->input('name', 'testsite');
+
+    $wordpressPort = 8081;
+    $mysqlPort = 3307;
+    $redisPort = 6380;
+
+    $dbName = 'wordpress_' . $siteName;
+    $dbUser = 'wp_' . $siteName;
+    $dbPassword = 'password';
+    $rootPassword = 'root';
+
+    $timestamp = time();
+
+    $networkName = 'wpnetwork_' . $siteName;
+    $mysqlContainer = $siteName . '_db_' . $timestamp;
+    $wpContainer = $siteName . '_wp_' . $timestamp;
+    $redisContainer = $siteName . '_redis_' . $timestamp;
+
+    // -------- CREATE NETWORK --------
+    $check = trim(runCommand("docker network ls --filter name={$networkName} --format '{{.Name}}'", false));
+
+    if (empty($check)) {
+        runCommand("docker network create {$networkName}");
+    }
+
+    // -------- CREATE MYSQL --------
+    runCommand("docker run -d --name {$mysqlContainer} --network {$networkName} -p {$mysqlPort}:3306 -e MYSQL_ROOT_PASSWORD={$rootPassword} -e MYSQL_DATABASE={$dbName} -e MYSQL_USER={$dbUser} -e MYSQL_PASSWORD={$dbPassword} --restart unless-stopped mysql:8.0");
+
+    // -------- WAIT MYSQL READY --------
+    $maxAttempts = 30;
+
+    for ($i = 1; $i <= $maxAttempts; $i++) {
+
+        $res = shell_exec("docker exec {$mysqlContainer} mysqladmin ping -h localhost -u{$dbUser} -p{$dbPassword} 2>&1");
+
+        if (strpos($res, 'mysqld is alive') !== false) {
+            break;
+        }
+
+        sleep(2);
+    }
+
+    // -------- CREATE WORDPRESS --------
+    runCommand("docker run -d --name {$wpContainer} --network {$networkName} -p {$wordpressPort}:80 -e WORDPRESS_DB_HOST={$mysqlContainer}:3306 -e WORDPRESS_DB_USER={$dbUser} -e WORDPRESS_DB_PASSWORD={$dbPassword} -e WORDPRESS_DB_NAME={$dbName} --restart unless-stopped wordpress:latest");
+
+    // -------- CREATE REDIS --------
+    runCommand("docker run -d --name {$redisContainer} --network {$networkName} -p {$redisPort}:6379 --restart unless-stopped redis:alpine redis-server --appendonly yes");
+
+    return response()->json([
+        'success' => true,
+        'site' => $siteName,
+        'wordpress_url' => "http://localhost:$wordpressPort",
+        'containers' => [
+            'wordpress' => $wpContainer,
+            'mysql' => $mysqlContainer,
+            'redis' => $redisContainer
+        ]
+    ]);
+
+});
