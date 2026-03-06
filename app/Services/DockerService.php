@@ -10,7 +10,26 @@ class DockerService
     /**
      * Create WordPress container
      */
-public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = null)
+
+    /**
+ * Get a free host port starting from $startPort
+ */
+private function getFreePort($startPort = 8081)
+{
+    $port = $startPort;
+    while (true) {
+        // Check if any container is using this port
+        $output = shell_exec("docker ps --format '{{.Ports}}' | grep -w {$port}");
+        if (empty(trim($output))) {
+            return $port;
+        }
+        $port++;
+        if ($port > 65535) {
+            throw new \Exception('No free ports available.');
+        }
+    }
+}
+public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = null, $hostPort = null)
 {
     try {
         $siteName = preg_replace('/[^a-zA-Z0-9_-]/', '', $name);
@@ -27,101 +46,44 @@ public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = 
 
         $this->createNetworkIfNotExists('wpnetwork_' . $siteName);
 
-        Log::info("Creating WordPress container: {$containerName}");
-        Log::info("Linking to MySQL: {$mysqlContainer}");
+        // If port not provided, get a free one
+        if (!$hostPort) {
+            $hostPort = $this->getFreePort(8081);
+        }
 
-        // Map Docker container internal 80 to host 8081
-        $hostPort = 8081;
+        Log::info("Creating WordPress container: {$containerName} on port {$hostPort}");
+        Log::info("Linking to MySQL: {$mysqlContainer}");
 
         $command = "docker run -d " .
             "--name {$containerName} " .
             "--network wpnetwork_{$siteName} " .
-            "-p {$hostPort}:80 " . // <-- host port 8081
+            "-p {$hostPort}:80 " .
             "-e WORDPRESS_DB_HOST={$mysqlContainer}:3306 " .
             "-e WORDPRESS_DB_USER={$dbUser} " .
             "-e WORDPRESS_DB_PASSWORD={$dbPassword} " .
             "-e WORDPRESS_DB_NAME={$dbName} " .
-            "-e WORDPRESS_DB_CHARSET=utf8mb4 " .
-            "-e WORDPRESS_TABLE_PREFIX=wp_ " .
-            "--restart unless-stopped " .
-            "wordpress:latest 2>&1";
+            "--restart unless-stopped wordpress:latest 2>&1";
 
-        Log::debug('Docker command: ' . $command);
         $output = shell_exec($command);
-
-        if (strpos($output, 'Error') !== false) {
-            throw new \Exception('Docker error: ' . $output);
-        }
 
         sleep(5); // wait for WP to initialize
 
-        // ------------------ VHOST SETUP ------------------
-        $vhostDir = storage_path('vhosts/');
-        if (!file_exists($vhostDir)) {
-            mkdir($vhostDir, 0755, true);
-        }
-        $vhostFile = $vhostDir . "{$siteName}.conf";
-
-        $certPath = $vhostDir . "{$siteName}.crt";
-        $keyPath = $vhostDir . "{$siteName}.key";
-
-        if ($ssl) {
-            if (!file_exists($certPath) || !file_exists($keyPath)) {
-                shell_exec("openssl req -x509 -nodes -days 365 -newkey rsa:2048 " .
-                    "-keyout {$keyPath} -out {$certPath} " .
-                    "-subj \"/CN={$domain}\"");
-            }
-        }
-
-        $vhostContent = "<VirtualHost *:80>
-    ServerName {$domain}
-    DocumentRoot /var/www/html
-
-    ProxyPreserveHost On
-    ProxyPass / http://127.0.0.1:{$hostPort}/
-    ProxyPassReverse / http://127.0.0.1:{$hostPort}/
-</VirtualHost>\n";
-
-        if ($ssl) {
-            $vhostContent .= "<VirtualHost *:443>
-    ServerName {$domain}
-    DocumentRoot /var/www/html
-
-    SSLEngine on
-    SSLCertificateFile {$certPath}
-    SSLCertificateKeyFile {$keyPath}
-
-    ProxyPreserveHost On
-    ProxyPass / http://127.0.0.1:{$hostPort}/
-    ProxyPassReverse / http://127.0.0.1:{$hostPort}/
-</VirtualHost>";
-        }
-
-        file_put_contents($vhostFile, $vhostContent);
-
-        if (is_writable('/etc/apache2/sites-available/')) {
-            @symlink($vhostFile, "/etc/apache2/sites-available/{$siteName}.conf");
-            if ($ssl) {
-                shell_exec("a2enmod ssl 2>&1");
-            }
-            shell_exec("a2ensite {$siteName}.conf 2>&1");
-            shell_exec("systemctl reload apache2 2>&1");
-        } else {
-            Log::warning("Cannot write to /etc/apache2/sites-available/, vhost created in storage/vhosts/");
-        }
+        // ---------------- CREATE VHOST ----------------
+      if (PHP_OS_FAMILY === 'Linux') {
+    $this->createVirtualHost($domain, $hostPort, $ssl ?? false);
+} else {
+    Log::info("Skipping virtual host creation: not running on Linux.");
+}
 
         return [
             'success' => true,
-            'name' => $containerName,
+            'container' => $containerName,
+            'host_port' => $hostPort,
             'mysql_container' => $mysqlContainer,
             'db_name' => $dbName,
             'db_user' => $dbUser,
             'db_password' => $dbPassword,
-            'output' => $output,
-            'ssl_enabled' => $ssl,
-            'domain' => $domain,
-            'vhost_file' => $vhostFile,
-            'host_port' => $hostPort,
+            'output' => $output
         ];
 
     } catch (\Exception $e) {
@@ -274,14 +236,19 @@ public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = 
     /**
      * Create Apache virtual host dynamically
      */
-    public function createVirtualHost($domain, $port, $enableSSL = false)
-    {
-        try {
-            $confFile = preg_replace('/[^a-zA-Z0-9_.-]/', '', $domain) . '.conf';
-            $sitesAvailable = '/etc/apache2/sites-available';
-            $fullPath = "{$sitesAvailable}/{$confFile}";
+public function createVirtualHost($domain, $port)
+{
+    try {
+        $confFile = preg_replace('/[^a-zA-Z0-9_.-]/', '', $domain) . '.conf';
+        $sitesAvailable = '/etc/apache2/sites-available';
+        $fullPath = "{$sitesAvailable}/{$confFile}";
 
-            $vhost = "
+        // Use your existing SSL certificate and key
+        $certPath = "/home/minhaj/my-php-site/certs/{$domain}.crt";
+        $keyPath  = "/home/minhaj/my-php-site/certs/{$domain}.key";
+
+        // VirtualHost content for both HTTP and HTTPS
+        $vhost = "
 <VirtualHost *:80>
     ServerName {$domain}
     ProxyPreserveHost On
@@ -290,19 +257,7 @@ public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = 
     ErrorLog \${APACHE_LOG_DIR}/{$domain}_error.log
     CustomLog \${APACHE_LOG_DIR}/{$domain}_access.log combined
 </VirtualHost>
-";
 
-            if ($enableSSL) {
-                $certPath = "/etc/ssl/certs/{$domain}.crt";
-                $keyPath = "/etc/ssl/private/{$domain}.key";
-
-                if (!file_exists($certPath) || !file_exists($keyPath)) {
-                    shell_exec("openssl req -x509 -nodes -days 365 -newkey rsa:2048 "
-                        . "-keyout {$keyPath} -out {$certPath} "
-                        . "-subj \"/CN={$domain}\"");
-                }
-
-                $vhost .= "
 <VirtualHost *:443>
     ServerName {$domain}
     SSLEngine on
@@ -315,17 +270,18 @@ public function createWordPress($name, $domain, $ssl = false, $mysqlContainer = 
     CustomLog \${APACHE_LOG_DIR}/{$domain}_ssl_access.log combined
 </VirtualHost>
 ";
-            }
 
-            file_put_contents($fullPath, $vhost);
-            shell_exec("a2ensite {$confFile} && systemctl reload apache2");
+        file_put_contents($fullPath, $vhost);
 
-            return true;
-        } catch (\Exception $e) {
-            Log::error("Failed to create virtual host for {$domain}: " . $e->getMessage());
-            throw $e;
-        }
+        // Enable site and reload Apache
+        shell_exec("a2ensite {$confFile} && systemctl reload apache2");
+
+        return true;
+    } catch (\Exception $e) {
+        Log::error("Failed to create virtual host for {$domain}: " . $e->getMessage());
+        throw $e;
     }
+}
 
     /**
      * Create Docker network if not exists
